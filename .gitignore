@@ -1,0 +1,13 @@
+.Rhistory
+.RData
+.RDataTmp
+.Ruserdata
+.Rproj.user/
+.Rcache/
+*_cache/
+*_files/
+*.knit.md
+*.utf8.md
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,329 @@
+---
+title: "Predicción del rendimiento de combustible con R"
+subtitle: "Predicción del rendimiento de combustible en carretera"
+author: "Jorge Jiménez Ramírez"
+lang: es
+output:
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: true
+    number_sections: true
+    self_contained: true
+    mathjax: null
+---
+
+```{r configuracion, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = TRUE, error = FALSE,
+  comment = "#>", fig.align = "center", fig.width = 7, fig.height = 4.5,
+  out.width = "95%", dpi = 120
+)
+options(width = 85)
+```
+
+# Introducción
+
+En este proyecto utilizamos `mpg`, un conjunto de datos incluido en `ggplot2` que reúne registros de rendimiento de combustible de 38 modelos de automóviles, con observaciones de los años 1999 y 2008. Es un subconjunto de los datos de la Agencia de Protección Ambiental de Estados Unidos (EPA), según la [documentación de `mpg`](https://ggplot2.tidyverse.org/reference/mpg.html). Cada fila corresponde a una configuración de un automóvil; un mismo modelo puede aparecer varias veces.
+
+El objetivo es predecir el rendimiento en carretera, registrado en `hwy`, a partir de la cilindrada (`displ`), la cantidad de cilindros (`cyl`), la categoría del automóvil (`class`) y el tipo de tracción (`drv`). Se trata de un problema de **regresión**, porque buscamos predecir una cantidad numérica, expresada en millas por galón estadounidense (mpg). Un valor mayor de `hwy` indica que el automóvil puede recorrer más millas con un galón de combustible.
+
+# Análisis exploratorio de datos (EDA)
+
+Primero cargamos los datos y conservamos únicamente la respuesta y los cuatro predictores propuestos. **Hacemos la partición antes de explorar los valores o preparar la receta.** Por eso, aunque la explicación de la partición aparece en la sección siguiente, su código se ejecuta aquí. Las tablas descriptivas y los tres gráficos utilizan exclusivamente el conjunto de entrenamiento.
+
+```{r datos-y-particion}
+library(tidymodels)
+
+datos <- ggplot2::mpg |>
+  select(hwy, displ, cyl, class, drv)
+
+# Reservamos la prueba antes de explorar y preprocesar.
+set.seed(123)
+particion <- initial_split(datos, prop = 0.80, strata = hwy)
+entrenamiento <- training(particion)
+```
+
+## Tamaño, variables y valores faltantes
+
+El dataset original tiene `r nrow(ggplot2::mpg)` filas y `r ncol(ggplot2::mpg)` columnas. Para el proyecto conservamos `r ncol(datos)` columnas. El conjunto de entrenamiento contiene `r nrow(entrenamiento)` observaciones.
+
+La siguiente tabla muestra los tipos originales de las once variables. Esta descripción de la estructura no utiliza los valores del conjunto de prueba para tomar decisiones.
+
+```{r tipos-originales}
+tabla_tipos <- tibble(
+  Variable = names(ggplot2::mpg),
+  Tipo = vapply(ggplot2::mpg, typeof, character(1))
+)
+
+knitr::kable(tabla_tipos, caption = "Tipos de las variables del dataset original")
+```
+
+En la salida de R, `integer` representa números enteros, `double` representa números almacenados con precisión decimal y `character` corresponde a texto. Para el modelo, `class` y `drv` se tratarán como variables categóricas; `cyl` se mantendrá como predictor numérico.
+
+| Variable utilizada | Descripción | Unidad o categorías |
+|:---|:---|:---|
+| `hwy` | Rendimiento de combustible en carretera; respuesta | Millas por galón (mpg) |
+| `displ` | Cilindrada del motor | Litros |
+| `cyl` | Cantidad de cilindros | Conteo |
+| `class` | Categoría del automóvil | `2seater`, `compact`, `midsize`, `minivan`, `pickup`, `subcompact`, `suv` |
+| `drv` | Tipo de tracción | `f`: delantera; `r`: trasera; `4`: en las cuatro ruedas |
+
+```{r faltantes}
+tabla_faltantes <- tibble(
+  Variable = names(entrenamiento),
+  Faltantes = colSums(is.na(entrenamiento))
+)
+
+knitr::kable(tabla_faltantes, caption = "Valores faltantes en entrenamiento")
+```
+
+Las cinco variables utilizadas tienen `r sum(is.na(entrenamiento))` valores faltantes en entrenamiento. Por lo tanto, no necesitamos imputación.
+
+## Resúmenes estadísticos
+
+```{r resumen-numerico}
+summary(select(entrenamiento, hwy, displ, cyl))
+```
+
+En entrenamiento, el rendimiento medio es de `r round(mean(entrenamiento$hwy), 2)` mpg y la mediana es de `r median(entrenamiento$hwy)` mpg. La cilindrada varía entre `r min(entrenamiento$displ)` y `r max(entrenamiento$displ)` litros, y hay motores de entre `r min(entrenamiento$cyl)` y `r max(entrenamiento$cyl)` cilindros.
+
+```{r resumen-categorias}
+resumen_clase <- entrenamiento |>
+  group_by(class) |>
+  summarise(Cantidad = n(), `Mediana de hwy (mpg)` = median(hwy))
+
+knitr::kable(resumen_clase, caption = "Rendimiento por categoría en entrenamiento")
+
+entrenamiento |>
+  count(drv, name = "Cantidad") |>
+  knitr::kable(caption = "Observaciones por tipo de tracción en entrenamiento")
+```
+
+## Visualizaciones
+
+```{r histograma, fig.alt="Histograma del rendimiento en carretera de los automóviles de entrenamiento, en millas por galón."}
+ggplot(entrenamiento, aes(x = hwy)) +
+  geom_histogram(binwidth = 2, boundary = 0, fill = "#2379a8", color = "white") +
+  labs(
+    title = "Distribución del rendimiento en carretera",
+    x = "Rendimiento en carretera (mpg)", y = "Cantidad de automóviles"
+  ) +
+  theme_minimal()
+```
+
+El rendimiento va de `r min(entrenamiento$hwy)` a `r max(entrenamiento$hwy)` mpg. La mitad central de las observaciones se encuentra entre `r quantile(entrenamiento$hwy, 0.25)` y `r quantile(entrenamiento$hwy, 0.75)` mpg. El histograma muestra algunos valores altos, separados de la zona donde se concentra buena parte de los registros.
+
+```{r dispersion, fig.alt="Dispersión de cilindrada en litros y rendimiento en carretera en mpg, usando únicamente entrenamiento."}
+ggplot(entrenamiento, aes(x = displ, y = hwy)) +
+  geom_point(color = "#2379a8", alpha = 0.65) +
+  labs(
+    title = "Cilindrada y rendimiento en carretera",
+    x = "Cilindrada del motor (litros)", y = "Rendimiento en carretera (mpg)"
+  ) +
+  theme_minimal()
+```
+
+Los automóviles con mayor cilindrada tienden a recorrer menos millas por galón. También hay diferencias de rendimiento entre vehículos con cilindradas parecidas, de modo que esta característica por sí sola no describe toda la variación. La relación observada es una asociación y no demuestra causalidad.
+
+```{r cajas, fig.alt="Diagramas de cajas del rendimiento en carretera por categoría de automóvil en entrenamiento."}
+ggplot(entrenamiento, aes(x = class, y = hwy)) +
+  geom_boxplot(fill = "#b9d9e8") +
+  scale_x_discrete(labels = c(
+    "2seater" = "Biplaza", "compact" = "Compacto", "midsize" = "Mediano",
+    "minivan" = "Miniván", "pickup" = "Pickup",
+    "subcompact" = "Subcompacto", "suv" = "SUV"
+  )) +
+  labs(
+    title = "Rendimiento según la categoría del automóvil",
+    x = "Categoría", y = "Rendimiento en carretera (mpg)"
+  ) +
+  theme_minimal()
+```
+
+Los compactos tienen una mediana de `r median(entrenamiento$hwy[entrenamiento$class == "compact"])` mpg, mientras que las pickups y los SUV tienen medianas de `r median(entrenamiento$hwy[entrenamiento$class == "pickup"])` y `r median(entrenamiento$hwy[entrenamiento$class == "suv"])` mpg, respectivamente. Las cajas muestran que hay variación dentro de cada categoría y que algunas distribuciones se superponen. Además, los tamaños de los grupos son diferentes, como se observa en la tabla anterior.
+
+# Partición de los datos
+
+La partición creada al inicio reserva aproximadamente el **80 % para entrenamiento y el 20 % para prueba**. Usamos la mayor parte para aprender los patrones y comparar los modelos, pero dejamos una parte independiente para la evaluación final. Por el redondeo dentro de los estratos, quedaron `r nrow(entrenamiento)` registros de entrenamiento y `r nrow(datos) - nrow(entrenamiento)` de prueba.
+
+Utilizamos `strata = hwy`. Aunque la respuesta es numérica y no hay clases que balancear, `initial_split()` puede agruparla en intervalos para repartir mejor sus distintos niveles de rendimiento. La estratificación es útil en este conjunto pequeño, aunque no es obligatoria en todos los problemas de regresión. La semilla `123` permite repetir la partición.
+
+El conjunto de prueba permanece reservado: no lo usamos para explorar relaciones, preparar transformaciones ni elegir el modelo. La validación cruzada se hará solamente con entrenamiento.
+
+# Ingeniería de variables
+
+```{r receta}
+receta <- recipe(hwy ~ displ + cyl + class + drv, data = entrenamiento) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+```
+
+`step_dummy()` convierte `class` y `drv` en indicadores numéricos, dejando una categoría de referencia. Así pueden utilizarse en la regresión lineal. Usamos la misma receta para el árbol, aunque este también podría trabajar directamente con categorías, para mantener una preparación comparable.
+
+`step_zv()` elimina cualquier predictor sin variación que pudiera aparecer después de la codificación en algún pliegue. No imputamos porque no encontramos valores faltantes en entrenamiento. Tampoco normalizamos: estos dos modelos no necesitan igualar las escalas de los predictores. Conservamos los cuatro predictores propuestos, sin añadir interacciones ni transformaciones adicionales.
+
+La receta se incorpora a cada `workflow()` sin prepararla previamente con `prep()`. De esa manera, el preprocesamiento se ajusta dentro de cada pliegue, utilizando solamente su parte de entrenamiento.
+
+# Modelos candidatos
+
+```{r modelos}
+modelo_lineal <- linear_reg() |>
+  set_engine("lm")
+
+modelo_arbol <- decision_tree() |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+flujo_lineal <- workflow() |>
+  add_recipe(receta) |>
+  add_model(modelo_lineal)
+
+flujo_arbol <- workflow() |>
+  add_recipe(receta) |>
+  add_model(modelo_arbol)
+```
+
+La **regresión lineal** combina los predictores para estimar `hwy` mediante una relación lineal y diferencias entre categorías. El **árbol de decisión** divide los vehículos en grupos mediante reglas y asigna una predicción a cada grupo. Comparamos exactamente estos dos tipos de modelo, con los mismos predictores y sin optimizar hiperparámetros. El árbol conserva los valores predeterminados de su motor.
+
+# Validación cruzada y comparación
+
+```{r validacion-cruzada}
+set.seed(123)
+pliegues <- vfold_cv(entrenamiento, v = 5, strata = hwy)
+metricas <- metric_set(rmse, mae, rsq)
+
+# Ambos modelos se evalúan sobre los mismos cinco pliegues.
+cv_lineal <- fit_resamples(
+  flujo_lineal, resamples = pliegues, metrics = metricas
+)
+
+cv_arbol <- fit_resamples(
+  flujo_arbol, resamples = pliegues, metrics = metricas
+)
+```
+
+En cada ronda se entrena con cuatro partes y se evalúa con la restante, hasta que todas hayan servido para validar. Dentro de estos pliegues también estratificamos por `hwy` para repartir sus niveles de rendimiento.
+
+Usamos tres métricas:
+
+- **RMSE:** resume el error de predicción en mpg y da más peso a los errores grandes. Un valor menor es mejor.
+- **MAE:** es el promedio de las diferencias absolutas entre el valor observado y el predicho, en mpg. Un valor menor es mejor.
+- **R²:** usamos `rsq()` de `yardstick`, que calcula el cuadrado de la correlación entre lo observado y lo predicho. Mide qué tan bien siguen las predicciones la variación de los valores reales; un valor más cercano a 1 es mejor. No es un porcentaje de predicciones correctas ni mide por sí solo el tamaño de los errores.
+
+```{r tabla-validacion}
+resultados_cv <- bind_rows(
+  "Regresión lineal" = collect_metrics(cv_lineal),
+  "Árbol de decisión" = collect_metrics(cv_arbol),
+  .id = "Modelo"
+)
+
+tabla_cv <- resultados_cv |>
+  mutate(`DE entre pliegues` = std_err * sqrt(n)) |>
+  select(
+    Modelo, Métrica = .metric, Media = mean,
+    `DE entre pliegues`, Pliegues = n
+  )
+
+knitr::kable(
+  tabla_cv, digits = 3,
+  caption = "Métricas de validación cruzada: promedio y desviación estándar (DE)"
+)
+```
+
+La desviación estándar describe cuánto varía cada métrica entre los cinco pliegues; no es un intervalo de confianza. Los promedios corresponden a las cinco evaluaciones de cada modelo, no al conjunto de prueba.
+
+# Selección del modelo final
+
+```{r resumen-para-seleccion}
+# Revisamos también el RMSE de cada pliegue, sin consultar la prueba.
+rmse_pliegues <- bind_rows(
+  "Regresión lineal" = collect_metrics(cv_lineal, summarize = FALSE),
+  "Árbol de decisión" = collect_metrics(cv_arbol, summarize = FALSE),
+  .id = "Modelo"
+) |>
+  filter(.metric == "rmse") |>
+  select(Pliegue = id, Modelo, RMSE = .estimate) |>
+  pivot_wider(names_from = Modelo, values_from = RMSE)
+
+knitr::kable(rmse_pliegues, digits = 3, caption = "RMSE por pliegue (mpg)")
+
+rmse_lineal <- resultados_cv |>
+  filter(Modelo == "Regresión lineal", .metric == "rmse")
+rmse_arbol <- resultados_cv |>
+  filter(Modelo == "Árbol de decisión", .metric == "rmse")
+```
+
+Seleccionamos la **regresión lineal**. Su RMSE promedio es `r round(rmse_lineal$mean, 3)` mpg, frente a `r round(rmse_arbol$mean, 3)` mpg del árbol; la reducción es de aproximadamente `r round(100 * (1 - rmse_lineal$mean / rmse_arbol$mean), 1)` %. Además, tiene menor MAE y mayor R² promedio. El RMSE de la regresión lineal es menor en los cinco pliegues, por lo que la elección no depende de una ventaja mínima en una sola evaluación.
+
+El árbol presenta menor variación del RMSE entre pliegues: su desviación estándar es `r round(rmse_arbol$std_err * sqrt(rmse_arbol$n), 3)` mpg, frente a `r round(rmse_lineal$std_err * sqrt(rmse_lineal$n), 3)` mpg de la regresión. Reconocemos esa mayor variación, pero preferimos la regresión por sus menores errores y porque permite describir el modelo mediante coeficientes. Cinco pliegues no bastan para afirmar que la ventaja se mantendrá en cualquier muestra.
+
+```{r seleccion-final}
+# La decisión queda fijada antes de la evaluación final.
+flujo_final <- flujo_lineal
+```
+
+# Evaluación final
+
+Una vez elegido el modelo, `last_fit()` ajusta la receta y la regresión con todo el conjunto de entrenamiento y evalúa las predicciones sobre el conjunto de prueba reservado. Este es el único paso donde usamos esos registros para evaluar el desempeño.
+
+```{r evaluacion-final}
+set.seed(123)
+ajuste_final <- last_fit(
+  flujo_final, split = particion, metrics = metricas
+)
+
+metricas_prueba <- collect_metrics(ajuste_final)
+
+metricas_prueba |>
+  select(Métrica = .metric, Valor = .estimate) |>
+  knitr::kable(digits = 3, caption = "Desempeño final en el conjunto de prueba")
+
+# Valores reales de la evaluación para redactar los resultados.
+rmse_prueba <- metricas_prueba |>
+  filter(.metric == "rmse") |>
+  pull(.estimate)
+mae_prueba <- metricas_prueba |>
+  filter(.metric == "mae") |>
+  pull(.estimate)
+r2_prueba <- metricas_prueba |>
+  filter(.metric == "rsq") |>
+  pull(.estimate)
+```
+
+En los `r nrow(datos) - nrow(entrenamiento)` registros de prueba, las predicciones se apartan del rendimiento real en **`r round(mae_prueba, 2)` mpg en promedio**, según el MAE. El RMSE es de **`r round(rmse_prueba, 2)` mpg**; al dar más peso a los errores grandes, complementa la lectura del error promedio. Estos valores describen el desempeño del conjunto y no garantizan el mismo error para cada automóvil.
+
+El R² es de **`r round(r2_prueba, 3)`**, calculado como correlación al cuadrado. Las predicciones siguen buena parte de la variación observada en el rendimiento, aunque no coinciden exactamente con los valores reales. No interpretamos este número como un porcentaje de aciertos. La selección del modelo queda cerrada: no hacemos ajustes a partir de los resultados de prueba.
+
+# Conclusiones para una audiencia no técnica
+
+En los datos de entrenamiento, los automóviles de mayor cilindrada tienden a tener menor rendimiento en carretera. Los compactos muestran una mediana de rendimiento mayor que las pickups y los SUV, aunque hay diferencias dentro de cada categoría. Estas asociaciones ayudan a predecir, pero no permiten afirmar que una sola característica sea la causa del rendimiento observado.
+
+La regresión lineal logró mejores resultados que el árbol durante la validación cruzada y fue el modelo elegido. En la evaluación final, su error absoluto promedio fue de aproximadamente **`r round(mae_prueba, 2)` millas por galón**. Esto permite obtener una estimación orientativa para vehículos similares a los estudiados, con un margen de error que debe tenerse presente.
+
+El análisis utiliza una muestra pequeña de configuraciones de 38 modelos de los años 1999 y 2008. Hay varias filas de un mismo modelo comercial, y la división aleatoria por filas puede dejar configuraciones parecidas en entrenamiento y prueba. Por eso, esta evaluación no demuestra cómo funcionaría el modelo con marcas o modelos completamente nuevos. Tampoco representa todos los vehículos actuales ni las condiciones particulares de conducción de Costa Rica. Además, solo usamos cuatro características y dejamos fuera aspectos que también pueden relacionarse con el consumo.
+
+Como uso responsable, las predicciones deben presentarse como estimaciones, acompañadas de sus límites. No deberían sustituir los datos oficiales de consumo ni servir por sí solas para justificar una compra o afirmar que un vehículo es menos contaminante: aquí predecimos rendimiento de combustible, no emisiones. Las categorías con pocos registros también pueden estar peor representadas, y el error global no garantiza el mismo desempeño en todos los grupos.
+
+# Referencias y reproducibilidad
+
+La fuente del dataset es la [documentación oficial de `mpg` en `ggplot2`](https://ggplot2.tidyverse.org/reference/mpg.html), que remite a los datos de la EPA disponibles en [FuelEconomy.gov](https://fueleconomy.gov/). La documentación describe las variables y sus unidades. Para verificarla desde R se puede ejecutar `help("mpg", package = "ggplot2")`.
+
+El proyecto se desarrolló como trabajo final de un taller de Machine Learning en R, siguiendo el flujo de partición, receta, workflows, validación cruzada, selección y evaluación final con `last_fit()`. No se aplicaron clustering ni PCA, porque no son necesarios para esta tarea de regresión.
+
+Los paquetes principales son `ggplot2` para los datos y gráficos; `dplyr` y `tidyr` para organizar resultados; `rsample`, `recipes`, `parsnip`, `workflows`, `tune` y `yardstick`, cargados mediante `tidymodels`, para el modelado; `rpart` como motor del árbol; y `rmarkdown` y `knitr` para generar el informe. La regresión lineal utiliza el motor `lm` del paquete `stats`.
+
+El documento utiliza los datos incluidos en R y los paquetes, sin archivos externos de datos. Una vez instalados los paquetes, puede renderizarse desde su carpeta con:
+
+```{r como-renderizar, eval=FALSE}
+rmarkdown::render("Proyecto_Final_ML.Rmd", output_file = "docs/index.html", encoding = "UTF-8")
+```
+
+Las semillas se fijan antes de la partición y de los pliegues. Los resultados numéricos del texto se generan desde los objetos calculados, para que correspondan a la ejecución. Las versiones de R y de los paquetes se registran a continuación.
+
+```{r informacion-sesion}
+sessionInfo()
+```
