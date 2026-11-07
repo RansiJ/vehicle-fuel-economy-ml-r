@@ -29,7 +29,7 @@ R, tidymodels, ggplot2, rpart and R Markdown. The report includes the original t
 
 ## View report
 
-[Download the self-contained HTML report](docs/index.html) · [Read the R Markdown source](Proyecto_Final_ML.Rmd)
+[View the published report](https://ransij.github.io/vehicle-fuel-economy-ml-r/) · [HTML file](docs/index.html) · [R Markdown source](Proyecto_Final_ML.Rmd)
 
 Download the HTML and open it in a browser to explore the report without R. Its figures, styles and scripts are embedded.
 
